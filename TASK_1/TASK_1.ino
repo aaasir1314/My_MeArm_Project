@@ -39,7 +39,7 @@
 
 //占位
 #define TH1_OFFSET_DEG  90.0f
-#define TH2_OFFSET_DEG   90.0f
+#define TH2_OFFSET_DEG   0.0f
 #define TH3_OFFSET_DEG  90.0f
 #define TH1_GAIN        (+1.0f)
 #define TH2_GAIN        (+1.0f)
@@ -52,6 +52,7 @@
 #define FRAME_KEY_MARK  'K'
 #define FRAME_TAIL      '#'
 
+//占位
 #define HOME_SERVO1  90
 #define HOME_SERVO2  90
 #define HOME_SERVO3  90
@@ -61,6 +62,41 @@
 #define REC_FRAME_BYTES    6
 #define REC_FRAME_CAPACITY (REC_BUFFER_BYTES / REC_FRAME_BYTES)
 #define REC_SAMPLE_MS     100
+
+//占位
+#define PAPER_Z_MM        50     //落笔点
+#define PEN_UP_MM         25     //抬笔高度
+
+#define PLOT_STEP_MM      4.0f   //步长
+#define PLOT_STEP_DEG     3.0f   //角度步长
+#define PLOT_STEP_MS      40     //每个插值点之间的推进时间
+#define PLOT_SPEED_SCALE  1.0f
+#define SPLINE_STEPS      20     //平滑曲线每段的采样点数
+
+#define TEACH_MAX          5//示教点数
+
+
+//占位（画直线）
+#define DEMO_LINE_X1     100
+#define DEMO_LINE_Y1     -50
+#define DEMO_LINE_X2     100
+#define DEMO_LINE_Y2      50
+
+//占位（画N）
+#define DEMO_N_X1         85
+#define DEMO_N_Y1        -50
+#define DEMO_N_X2         85
+#define DEMO_N_Y2         50
+#define DEMO_N_X3        125
+#define DEMO_N_Y3        -50
+#define DEMO_N_X4        125
+#define DEMO_N_Y4         50
+
+#define KEY_PAUSE    5     //暂停绘图
+#define KEY_RESUME   6     //继续绘图
+#define KEY_CANCEL   7     //取消绘图
+#define KEY_TEACH    8     //开始示教
+#define KEY_PLAY     9     //启动绘图
 
 Servo servos[3];
 const uint8_t servoPins[3] = { PIN_BASE, PIN_SHOULDER, PIN_ELBOW };
@@ -84,6 +120,18 @@ int g_placeX, g_placeY, g_placeZ;
 bool recStopRequest = false;
 bool recording = false; 
 
+struct PlotPoint { float s1, s2, s3; };  //底座、大臂、小臂的舵机角
+
+bool plotActive    = false;
+bool plotPauseReq  = false;
+bool plotResumeReq = false;
+bool plotCancelReq = false;
+bool teachMode     = false;
+uint8_t teachCount = 0;//已记录的示教点数
+
+PlotPoint teachPts[TEACH_MAX];//储存示教点
+float plotSavedScale = 0.6f;
+
 //占位
 struct Target { int grabX, grabY, grabZ, placeX, placeY, placeZ, clawDeg; };//抓取点x, 抓取点y, 抓取点z,  放置点x, 放置点y, 放置点z,  夹持角
 Target g_targetA = { 90, 0, 50,   90, -50, 75,  115 };
@@ -105,7 +153,6 @@ uint16_t recCount = 0;//计数器
 unsigned long recHoldMs = 0;
 
 uint8_t t3Counter = 0; //夹取物体循环计数
-
 
 void setup() {
   Serial.begin(115200);
@@ -154,6 +201,10 @@ void handleLine(char* line) {
     return;
   }
 
+  if (plotActive &&!(line[0] == '5' || line[0] == '6' || line[0] == '7')) {
+    return;
+  }
+
   if (line[1] == '\0'){
     switch (line[0])
      {
@@ -182,10 +233,15 @@ void handleLine(char* line) {
         printSpeed();
         return;
 
-//目前没有拓展板，暂时用1234替代按钮输入。
-      case '1': case '2': case '3': case '4':
+      case '1': case '2': case '3': case '4':case '5': case '6': case '7': case '8': case '9':
         execKey((uint8_t)(line[0] - '0'));
         return;
+
+      case 'f': printFk();         return;
+      case 'a': plotRunLine();     return;
+      case 'n': plotRunGraph();    return;
+      case 'p': plotRunPolyline(); return;
+      case 'c': plotRunSpline();   return;
 
     }
   }
@@ -463,7 +519,6 @@ bool ikSolve(int xMm, int yMm, int zMm,float* t1Out, float* t2Out, float* t3Out)
   *t3Out = t3Rad * RAD2DEG;
   return true;
 }
-
 void jointToServo(float t1, float t2, float t3,int* s1Out, int* s2Out, int* s3Out) {
   *s1Out = (int)(TH1_OFFSET_DEG + TH1_GAIN * t1 + 0.5f);
   *s2Out = (int)(TH2_OFFSET_DEG + TH2_GAIN * t2 + 0.5f);
@@ -481,21 +536,20 @@ void fpFeed(char c) {
     case FP_WAIT_HEAD:
       if (c == FRAME_HEAD) {
         fpState = FP_WAIT_K;
-      break;
       }
+      break;
     case FP_WAIT_K:
       if (c == FRAME_HEAD) {
         break;
-        }
+      }
       if (c == FRAME_KEY_MARK) {
         fpState = FP_WAIT_DIGIT;
+        break;
       }
-      else {
-        fpState = FP_WAIT_HEAD;
+      fpState = FP_WAIT_HEAD;
       break;
-      }
     case FP_WAIT_DIGIT:
-      if (c >= '1' && c <= '4') {
+      if (c >= '1' && c <= '9') {
         fpPendingKey = (uint8_t)(c - '0');
         fpState = FP_WAIT_TAIL;
       } else {
@@ -614,6 +668,19 @@ void goHome() {
 }
 
 void execKey(uint8_t k) {
+  if (plotActive) {
+    if (k == KEY_PAUSE){
+      plotPauseReq  = true;
+    }
+    if (k == KEY_RESUME){
+      plotResumeReq = true;
+    }
+    if (k == KEY_CANCEL){
+      plotCancelReq = true;
+    }
+    return;
+  }
+
   switch (k) {
 
     case 1: {
@@ -644,5 +711,326 @@ void execKey(uint8_t k) {
     case 4:
       goHome();
       return;
+
+    case KEY_TEACH: {
+      teachRecord();
+      return;
+    }
+    case KEY_PLAY: {
+      plotRunPolyline();
+      return;
+    }
+    case KEY_PAUSE: case KEY_RESUME: case KEY_CANCEL:
+      Serial.println(F("PLOT_IDLE")); 
+      return;
   }
+
+}
+  void servoToJoint(int s1, int s2, int s3, float* t1Out, float* t2Out, float* t3Out) {
+  *t1Out = (s1 - TH1_OFFSET_DEG) / TH1_GAIN;
+  *t2Out = (s2 - TH2_OFFSET_DEG) / TH2_GAIN;
+  *t3Out = (s3 - TH3_OFFSET_DEG) / TH3_GAIN;
+}
+
+void fkSolve(float t1, float t2, float t3, float* xOut, float* yOut, float* zOut) {
+  float t1r = t1 / RAD2DEG;
+  float t2r = t2 / RAD2DEG;
+  float t3r = t3 / RAD2DEG;
+
+  float rw  = L1_MM * cosf(t2r) + L2_MM * cosf(t3r);   //腕点的水平距离
+  float zz  = L1_MM * sinf(t2r) + L2_MM * sinf(t3r);   //腕点的高度
+  float rho = rw + L3_MM;                              //末端水平距离
+
+  *xOut = rho * cosf(t1r);
+  *yOut = rho * sinf(t1r);
+  *zOut = zz;
+}
+
+void printFk() {
+  float t1, t2, t3, x, y, z;
+  servoToJoint((int)(targetAngle[0] + 0.5f),(int)(targetAngle[1] + 0.5f),(int)(targetAngle[2] + 0.5f), &t1, &t2, &t3);
+  fkSolve(t1, t2, t3, &x, &y, &z);
+  Serial.print(F("FK:"));
+  Serial.print((int)(x + 0.5f));
+  Serial.print(',');
+  Serial.print((int)(y + 0.5f));
+  Serial.print(',');
+  Serial.println((int)(z + 0.5f));
+}
+
+void plotPump() {
+  readSerial();
+  tick(millis());
+
+  if (plotPauseReq) {
+    plotPauseReq = false;
+    Serial.println(F("暂停"));
+    while (!plotResumeReq && !plotCancelReq) {
+      readSerial();
+      tick(millis());
+    }
+    if (!plotCancelReq) {
+      plotResumeReq = false;
+      Serial.println(F("继续"));
+    }
+  }
+}
+
+void plotWaitArrived() {
+  while (!grabArrived() && !plotCancelReq) plotPump();
+}
+
+void plotWaitMs(unsigned long ms) {
+  unsigned long start = millis();
+  while ((millis() - start) < ms) {
+    plotPump();
+    if (plotCancelReq) return;
+  }
+}
+
+bool plotMoveTo(float x, float y, int z) {
+  moveTo((int)(x + 0.5f), (int)(y + 0.5f), z);
+  plotWaitArrived();
+  return !plotCancelReq;
+}
+
+void plotPenUp() {
+  float t1, t2, t3, x, y, z;
+  servoToJoint((int)(targetAngle[0] + 0.5f),(int)(targetAngle[1] + 0.5f),(int)(targetAngle[2] + 0.5f), &t1, &t2, &t3);
+  fkSolve(t1, t2, t3, &x, &y, &z);
+  moveTo((int)(x + 0.5f), (int)(y + 0.5f), (int)(z + 0.5f) + PEN_UP_MM);
+  plotWaitArrived();
+}
+
+void drawLineSeg(float ax, float ay, float bx, float by) {
+  if (!plotMoveTo(ax, ay, PAPER_Z_MM + PEN_UP_MM)){
+    return;
+    }//抬笔到起点上方
+  if (!plotMoveTo(ax, ay, PAPER_Z_MM)){
+    return;
+    }//落笔
+
+  float dx = bx - ax, dy = by - ay;
+  float len = sqrtf(dx * dx + dy * dy);
+  int steps = (int)(len / PLOT_STEP_MM + 0.5f);
+  if (steps < 1) steps = 1;
+
+  for (int i = 1; i <= steps; i++) {
+    float u = (float)i / (float)steps;
+    moveTo((int)(ax + dx * u + 0.5f), (int)(ay + dy * u + 0.5f), PAPER_Z_MM);
+    plotWaitMs(PLOT_STEP_MS);
+    if (plotCancelReq){
+      return;
+    }
+  }
+
+  plotMoveTo(bx, by, PAPER_Z_MM + PEN_UP_MM);//收笔抬离纸面
+}
+
+void plotBegin(const char* tag) {
+  plotSavedScale = speedScale;
+  speedScale     = PLOT_SPEED_SCALE;      //绘制速度锁定，保证轨迹平稳
+  plotActive     = true;
+  plotPauseReq   = false;
+  plotResumeReq  = false;
+  plotCancelReq  = false;
+  Serial.print(F("PLOT_START:"));
+  Serial.println(tag);
+}
+
+void plotEnd(bool cancelled) {
+  plotCancelReq = false;
+  plotPauseReq  = false;
+  plotResumeReq = false;
+
+  plotPenUp();
+  targetAngle[0] = HOME_SERVO1;
+  targetAngle[1] = HOME_SERVO2;
+  targetAngle[2] = HOME_SERVO3;
+  plotWaitArrived();
+
+  speedScale = plotSavedScale;
+  plotActive = false;
+
+  Serial.println(cancelled ? F("PLOT_CANCEL") : F("PLOT_DONE"));
+}
+
+void plotRunLine() {//画直线
+  plotBegin("LINE");
+  plotPenUp();
+  drawLineSeg(DEMO_LINE_X1, DEMO_LINE_Y1, DEMO_LINE_X2, DEMO_LINE_Y2);
+  plotEnd(plotCancelReq);
+}
+
+void plotRunGraph() {//画N
+  plotBegin("GRAPH_N");
+  plotPenUp();
+  drawLineSeg(DEMO_N_X1, DEMO_N_Y1, DEMO_N_X2, DEMO_N_Y2);
+  if (!plotCancelReq){
+    drawLineSeg(DEMO_N_X2, DEMO_N_Y2, DEMO_N_X3, DEMO_N_Y3);
+  }
+  if (!plotCancelReq){
+    drawLineSeg(DEMO_N_X3, DEMO_N_Y3, DEMO_N_X4, DEMO_N_Y4);
+  }
+  plotEnd(plotCancelReq);
+}
+
+void teachRecord() {//示教记录
+  if (!teachMode) {
+    teachMode  = true;
+    teachCount = 0;
+    Serial.println(F("TEACH_START"));
+    return;
+  }
+
+  if (teachCount >= TEACH_MAX) return;
+
+  teachPts[teachCount].s1 = targetAngle[0];
+  teachPts[teachCount].s2 = targetAngle[1];
+  teachPts[teachCount].s3 = targetAngle[2];
+  teachCount++;
+
+  Serial.print(F("TEACH_PT"));
+  Serial.print(teachCount);
+  Serial.print(':');
+  Serial.print((int)(targetAngle[0] + 0.5f));
+  Serial.print(',');
+  Serial.print((int)(targetAngle[1] + 0.5f));
+  Serial.print(',');
+  Serial.println((int)(targetAngle[2] + 0.5f));
+
+  if (teachCount >= TEACH_MAX) {
+    teachMode = false;
+    Serial.println(F("TEACH_DONE"));
+  }
+}
+
+//五点示教折线
+bool teachGotoAbove(uint8_t idx) {
+  float t1, t2, t3, x, y, z;
+  servoToJoint((int)(teachPts[idx].s1 + 0.5f),(int)(teachPts[idx].s2 + 0.5f),(int)(teachPts[idx].s3 + 0.5f), &t1, &t2, &t3);
+  fkSolve(t1, t2, t3, &x, &y, &z);
+  return plotMoveTo(x, y, PAPER_Z_MM + PEN_UP_MM);
+}
+
+bool teachDescend(uint8_t idx) {
+  targetAngle[0] = teachPts[idx].s1;
+  targetAngle[1] = teachPts[idx].s2;
+  targetAngle[2] = teachPts[idx].s3;
+  plotWaitArrived();
+  return !plotCancelReq;
+}
+
+bool angleSegTo(uint8_t a, uint8_t b) {
+  float d1 = teachPts[b].s1 - teachPts[a].s1;
+  float d2 = teachPts[b].s2 - teachPts[a].s2;
+  float d3 = teachPts[b].s3 - teachPts[a].s3;
+
+  float dmax = fmaxf(fmaxf(fabsf(d1), fabsf(d2)), fabsf(d3));
+  int steps = (int)(dmax / PLOT_STEP_DEG + 0.5f);
+  if (steps < 1){
+    steps = 1;
+  }
+
+  for (int i = 1; i <= steps; i++) {
+    float u = (float)i / (float)steps;
+    targetAngle[0] = teachPts[a].s1 + d1 * u;
+    targetAngle[1] = teachPts[a].s2 + d2 * u;
+    targetAngle[2] = teachPts[a].s3 + d3 * u;
+    plotWaitMs(PLOT_STEP_MS);
+    if (plotCancelReq){
+      return false;
+    }
+  }
+  return true;
+}
+
+void plotRunPolyline() {
+  if (teachCount < 2) {
+    Serial.println(F("PLOT_ERR:NO_TEACH"));
+    return;
+  }
+  plotBegin("POLYLINE");
+
+  targetAngle[0] = HOME_SERVO1;
+  targetAngle[1] = HOME_SERVO2;
+  targetAngle[2] = HOME_SERVO3;
+  plotWaitArrived();
+  if (plotCancelReq){ 
+    plotEnd(true); 
+    return; 
+    }
+
+  if (!teachGotoAbove(0)) {
+     plotEnd(true);
+     return; 
+     }//抬笔到第一点上方
+  if (!teachDescend(0)){ 
+    plotEnd(true); 
+    return; 
+    }//落笔
+
+  for (uint8_t i = 0; i + 1 < teachCount; i++) {
+    if (plotCancelReq){
+      break;
+    }
+    if (!angleSegTo(i, i + 1)){
+      break;
+    }
+  }
+
+  plotEnd(plotCancelReq);
+}
+
+//五点示教曲线
+float crAxis(float p0, float p1, float p2, float p3, float u) {
+  float u2 = u * u, u3 = u2 * u;
+  return 0.5f * ((2.0f * p1)+ (-p0 + p2) *u + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * u2+ (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * u3);
+}
+
+void crPoint(int idx, float* s1Out, float* s2Out, float* s3Out) {
+  if (idx < 0) idx = 0;
+  if (idx >= (int)teachCount) idx = (int)teachCount - 1;
+  *s1Out = teachPts[idx].s1;
+  *s2Out = teachPts[idx].s2;
+  *s3Out = teachPts[idx].s3;
+}
+
+void plotRunSpline() {
+  if (teachCount < 2) {
+    Serial.println(F("PLOT_ERR:NO_TEACH"));
+    return;
+  }
+  plotBegin("SPLINE");
+
+  targetAngle[0] = HOME_SERVO1;//回中
+  targetAngle[1] = HOME_SERVO2;
+  targetAngle[2] = HOME_SERVO3;
+  plotWaitArrived();
+  if (plotCancelReq) { plotEnd(true); return; }
+
+  if (!teachGotoAbove(0)) { plotEnd(true); return; }
+  if (!teachDescend(0))   { plotEnd(true); return; }
+
+  for (uint8_t j = 0; j + 1 < teachCount; j++) {
+    float a1, a2, a3, b1, b2, b3, c1, c2, c3, e1, e2, e3;
+    crPoint((int)j - 1, &a1, &a2, &a3);
+    crPoint((int)j,     &b1, &b2, &b3);
+    crPoint((int)j + 1, &c1, &c2, &c3);
+    crPoint((int)j + 2, &e1, &e2, &e3);
+
+    for (int s = 1; s <= SPLINE_STEPS; s++) {
+      float u = (float)s / (float)SPLINE_STEPS;
+      targetAngle[0] = crAxis(a1, b1, c1, e1, u);
+      targetAngle[1] = crAxis(a2, b2, c2, e2, u);
+      targetAngle[2] = crAxis(a3, b3, c3, e3, u);
+      plotWaitMs(PLOT_STEP_MS);
+      if (plotCancelReq){
+         plotEnd(true); 
+         return;
+        }
+    }
+  }
+
+  plotEnd(false);
 }
