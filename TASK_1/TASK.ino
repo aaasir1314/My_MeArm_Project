@@ -97,6 +97,7 @@
 #define KEY_CANCEL   7     //取消绘图
 #define KEY_TEACH    8     //开始示教
 #define KEY_PLAY     9     //启动绘图
+#define KEY_SPLINE   10    //启动曲线绘制
 
 Servo servos[3];
 const uint8_t servoPins[3] = { PIN_BASE, PIN_SHOULDER, PIN_ELBOW };
@@ -233,14 +234,9 @@ void handleLine(char* line) {
         printSpeed();
         return;
 
-      case '1': case '2': case '3': case '4':case '5': case '6': case '7': case '8': case '9':
-        execKey((uint8_t)(line[0] - '0'));
-        return;
-
       case 'f': printFk();         return;
       case 'a': plotRunLine();     return;
       case 'n': plotRunGraph();    return;
-      case 'p': plotRunPolyline(); return;
       case 'c': plotRunSpline();   return;
 
     }
@@ -549,8 +545,8 @@ void fpFeed(char c) {
       fpState = FP_WAIT_HEAD;
       break;
     case FP_WAIT_DIGIT:
-      if (c >= '1' && c <= '9') {
-        fpPendingKey = (uint8_t)(c - '0');
+      if (c >= '0' && c <= '9') {
+        fpPendingKey = (c == '0') ? 10 : (uint8_t)(c - '0');
         fpState = FP_WAIT_TAIL;
       } else {
         fpState = (c == FRAME_HEAD) ? FP_WAIT_K : FP_WAIT_HEAD;
@@ -718,6 +714,10 @@ void execKey(uint8_t k) {
     }
     case KEY_PLAY: {
       plotRunPolyline();
+      return;
+    }
+    case KEY_SPLINE: {
+      plotRunSpline();
       return;
     }
     case KEY_PAUSE: case KEY_RESUME: case KEY_CANCEL:
